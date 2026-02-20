@@ -176,37 +176,49 @@ def fetch_daily_reaches(counter_id: str, date1: str, date2: str, goal_ids: list)
 def detect_first_trigger_date(counter_id: str, goal_ids: list) -> str | None:
     """
     Определить дату первого срабатывания любой из указанных целей.
-    Ищем от самой ранней возможной даты (2005-01-01 — начало Метрики)
-    до сегодня с группировкой по месяцам, потом уточняем до дня.
+    Ищем по годам (2015..сегодня), чтобы не упереться в лимит
+    "Query is too complicated" при запросе за весь период сразу.
+    Для каждой цели берём самую раннюю дату.
     """
-    today = date.today().isoformat()
+    today_d = date.today()
     earliest_date = None
 
     for gid in goal_ids:
-        # Запрос за весь период с группировкой по месяцу для скорости
-        params = {
-            "id": counter_id,
-            "metrics": f"ym:s:goal{gid}reaches",
-            "dimensions": "ym:s:date",
-            "date1": "2015-01-01",
-            "date2": today,
-            "sort": "ym:s:date",
-            "limit": 100000,
-        }
-        data, err = api_get(
-            "https://api-metrika.yandex.net/stat/v1/data",
-            params=params, timeout=180
-        )
-        if err or not data:
-            continue
+        found_for_goal = None
+        for year in range(2015, today_d.year + 1):
+            d1 = f"{year}-01-01"
+            d2 = f"{year}-12-31" if year < today_d.year else today_d.isoformat()
 
-        for item in data.get("data", []):
-            reaches = item["metrics"][0]
-            if reaches and reaches > 0:
-                dt_str = item["dimensions"][0]["name"]
-                if earliest_date is None or dt_str < earliest_date:
-                    earliest_date = dt_str
-                break  # нашли первый день для этой цели
+            params = {
+                "id": counter_id,
+                "metrics": f"ym:s:goal{gid}reaches",
+                "dimensions": "ym:s:date",
+                "date1": d1,
+                "date2": d2,
+                "sort": "ym:s:date",
+                "limit": 1000,
+            }
+            data, err = api_get(
+                "https://api-metrika.yandex.net/stat/v1/data",
+                params=params, timeout=60
+            )
+            if err or not data:
+                log.warning(f"detect_first_trigger goal={gid} year={year}: {err}")
+                continue
+
+            for item in data.get("data", []):
+                reaches = item["metrics"][0]
+                if reaches and reaches > 0:
+                    found_for_goal = item["dimensions"][0]["name"]
+                    break  # нашли первый день в этом году
+
+            if found_for_goal:
+                break  # нашли год — дальше не ищем
+
+        if found_for_goal:
+            log.info(f"Goal {gid}: first trigger = {found_for_goal}")
+            if earliest_date is None or found_for_goal < earliest_date:
+                earliest_date = found_for_goal
 
     return earliest_date
 
@@ -405,22 +417,41 @@ def cmd_goals(message):
 def cmd_main(message):
     if not guard(message):
         return
+    s = st(message.chat.id)
+    if not s["counter_id"]:
+        bot.send_message(message.chat.id, "⚠️ Сначала задайте счётчик: /counter <id>")
+        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        bot.send_message(message.chat.id, "Пример: <code>/main 255302693,257143059</code>")
+        bot.send_message(message.chat.id, "Пример: <code>/main 255302693,257143059</code>\n\nИспользуйте /goals чтобы увидеть ID целей.")
         return
     ids = [int(x.strip()) for x in args[1].split(",") if x.strip().isdigit()]
     if not ids:
         bot.send_message(message.chat.id, "⚠️ Не распознаны ID целей. Пример: <code>/main 123,456</code>")
         return
-    st(message.chat.id)["main_goal_ids"] = ids
+    # Проверяем что цели принадлежат этому счётчику
+    goals_map, err = get_goals(s["counter_id"])
+    if err:
+        bot.send_message(message.chat.id, f"❌ Ошибка проверки целей: {err}")
+        return
+    bad_ids = [gid for gid in ids if gid not in goals_map]
+    if bad_ids:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Цели {', '.join(map(str, bad_ids))} <b>не найдены</b> в счётчике {s['counter_id']}.\n"
+            f"Проверьте ID через /goals"
+        )
+        return
+    name_list = [f"{gid} ({goals_map[gid]})" for gid in ids]
+    s["main_goal_ids"] = ids
     # Сбросить ручной период → автоопределение
-    st(message.chat.id)["date1"] = None
-    st(message.chat.id)["date2"] = None
+    s["date1"] = None
+    s["date2"] = None
     save()
     bot.send_message(
         message.chat.id,
-        f"✅ Главные цели: <b>{', '.join(map(str, ids))}</b>\n"
+        f"✅ Главные цели:\n" +
+        "\n".join(f"  • {n}" for n in name_list) + "\n\n"
         f"📅 Период будет определён автоматически при /run.\n"
         f"Или задайте вручную: /period"
     )
