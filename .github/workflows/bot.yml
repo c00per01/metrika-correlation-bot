@@ -1,0 +1,37 @@
+name: Telegram Bot 24/7
+
+on:
+  # Автоматический перезапуск каждые 5 часов
+  schedule:
+    - cron: "0 */5 * * *"
+  # Ручной запуск из интерфейса GitHub
+  workflow_dispatch:
+  # Запуск при пуше в main
+  push:
+    branches: [main]
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # ~5ч 50мин, с запасом до следующего cron
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          METRIKA_OAUTH_TOKEN: ${{ secrets.METRIKA_OAUTH_TOKEN }}
+          ALLOWED_USER_ID: ${{ secrets.ALLOWED_USER_ID }}
+        run: |
+          timeout 20400 python metrika_bot.py || true
+          # timeout 20400 = 5ч 40мин, бот корректно завершится и GitHub Actions перезапустит его по cron
