@@ -1,6 +1,6 @@
 """
 Telegram-бот для анализа корреляций целей Яндекс.Метрики.
-Автоопределение периода, автосохранение настроек, метрика ср. срабатываний/неделя.
+Интерактивный UX: списки счётчиков и целей через inline-кнопки.
 """
 import os
 import sys
@@ -8,7 +8,7 @@ import json
 import re
 import logging
 import traceback
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 import requests
 import pandas as pd
@@ -38,7 +38,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Persistent State (JSON) ──────────────────────────────
+MSG_NO_COUNTER = "⚠️ Сначала выберите счётчик: /counters"
+
+# ─── Persistent State ─────────────────────────────────────
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 
@@ -68,9 +70,12 @@ def st(chat_id) -> dict:
     if key not in STATE:
         STATE[key] = {
             "counter_id": None,
-            "date1": None,   # может быть None → будет вычислен автоматически
-            "date2": None,   # может быть None → будет today
+            "counter_name": None,
+            "date1": None,
+            "date2": None,
             "main_goal_ids": [],
+            # временный буфер: цели, выбранные через чекбоксы (до подтверждения)
+            "pending_goal_ids": [],
         }
         _save_state(STATE)
     return STATE[key]
@@ -80,7 +85,7 @@ def save():
     _save_state(STATE)
 
 
-# ─── Guard ─────────────────────────────────────────────────
+# ─── Guard ────────────────────────────────────────────────
 def guard(message):
     if not ALLOWED_USER_ID:
         return True
@@ -93,9 +98,8 @@ def guard_cb(call):
     return str(call.from_user.id) == ALLOWED_USER_ID
 
 
-# ─── Метрика API ──────────────────────────────────────────
+# ─── Metrika API ──────────────────────────────────────────
 def api_get(url, params=None, timeout=120):
-    """GET с обработкой ошибок."""
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
         r.raise_for_status()
@@ -111,8 +115,26 @@ def api_get(url, params=None, timeout=120):
         return None, f"Ошибка запроса: {e}"
 
 
+def get_counters():
+    """Список счётчиков: [{id, name, site}]"""
+    data, err = api_get(
+        "https://api-metrika.yandex.net/management/v1/counters",
+        params={"per_page": 100}, timeout=30
+    )
+    if err:
+        return None, err
+    counters = data.get("counters", [])
+    return [
+        {
+            "id": str(c["id"]),
+            "name": c.get("name") or c.get("site", str(c["id"])),
+            "site": c.get("site", ""),
+        }
+        for c in counters
+    ], None
+
+
 def get_goals(counter_id: str):
-    """Получить dict {goal_id: goal_name}."""
     url = f"https://api-metrika.yandex.net/management/v1/counter/{counter_id}/goals"
     data, err = api_get(url, timeout=60)
     if err:
@@ -127,7 +149,6 @@ def chunked(lst, n):
 
 
 def fetch_daily_reaches(counter_id: str, date1: str, date2: str, goal_ids: list):
-    """Получить DataFrame: index=date, columns=goal_id, values=reaches."""
     metrics = [f"ym:s:goal{gid}reaches" for gid in goal_ids]
     out = None
 
@@ -157,15 +178,8 @@ def fetch_daily_reaches(counter_id: str, date1: str, date2: str, goal_ids: list)
                 row[gid] = v
             rows.append(row)
 
-        if rows:
-            part_df = pd.DataFrame(rows).set_index("date")
-        else:
-            part_df = pd.DataFrame()
-
-        if out is None:
-            out = part_df
-        else:
-            out = out.join(part_df, how="outer")
+        part_df = pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
+        out = part_df if out is None else out.join(part_df, how="outer")
 
     if out is None or out.empty:
         return pd.DataFrame(), None
@@ -174,12 +188,6 @@ def fetch_daily_reaches(counter_id: str, date1: str, date2: str, goal_ids: list)
 
 
 def detect_first_trigger_date(counter_id: str, goal_ids: list) -> str | None:
-    """
-    Определить дату первого срабатывания любой из указанных целей.
-    Ищем по годам (2015..сегодня), чтобы не упереться в лимит
-    "Query is too complicated" при запросе за весь период сразу.
-    Для каждой цели берём самую раннюю дату.
-    """
     today_d = date.today()
     earliest_date = None
 
@@ -188,7 +196,6 @@ def detect_first_trigger_date(counter_id: str, goal_ids: list) -> str | None:
         for year in range(2015, today_d.year + 1):
             d1 = f"{year}-01-01"
             d2 = f"{year}-12-31" if year < today_d.year else today_d.isoformat()
-
             params = {
                 "id": counter_id,
                 "metrics": f"ym:s:goal{gid}reaches",
@@ -205,15 +212,13 @@ def detect_first_trigger_date(counter_id: str, goal_ids: list) -> str | None:
             if err or not data:
                 log.warning(f"detect_first_trigger goal={gid} year={year}: {err}")
                 continue
-
             for item in data.get("data", []):
                 reaches = item["metrics"][0]
                 if reaches and reaches > 0:
                     found_for_goal = item["dimensions"][0]["name"]
-                    break  # нашли первый день в этом году
-
+                    break
             if found_for_goal:
-                break  # нашли год — дальше не ищем
+                break
 
         if found_for_goal:
             log.info(f"Goal {gid}: first trigger = {found_for_goal}")
@@ -223,21 +228,14 @@ def detect_first_trigger_date(counter_id: str, goal_ids: list) -> str | None:
     return earliest_date
 
 
-# ─── Корреляции ────────────────────────────────────────────
+# ─── Аналитика ────────────────────────────────────────────
 def compute_correlations(df: pd.DataFrame, main_goal_ids: list):
-    """
-    Считаем корреляцию каждой цели с объединённой главной целью.
-    Возвращает (dict {goal_id: corr_value}, error_string).
-    """
     present_main = [gid for gid in main_goal_ids if gid in df.columns]
     if not present_main:
         return None, "Главные цели не найдены в данных за период."
-
-    # Объединённая главная цель: сумма срабатываний выбранных целей за день
     main_series = df[present_main].sum(axis=1)
     if main_series.sum() == 0:
         return None, "По главным целям за период нет достижений — корреляция невозможна."
-
     results = {}
     for gid in df.columns:
         if gid in present_main:
@@ -247,148 +245,165 @@ def compute_correlations(df: pd.DataFrame, main_goal_ids: list):
         c = df[gid].corr(main_series)
         if pd.notna(c) and abs(c) >= THRESHOLD:
             results[int(gid)] = float(c)
-
     return results, None
 
 
 def compute_weekly_rate(df: pd.DataFrame, goal_ids: list) -> dict:
-    """
-    Среднее количество срабатываний каждой цели в неделю.
-    Формула: total_reaches / (кол-во дней в периоде / 7).
-    """
     if df.empty:
         return {}
-
-    num_days = len(df)
-    num_weeks = max(num_days / 7.0, 1.0)
-
-    rates = {}
-    for gid in goal_ids:
-        if gid in df.columns:
-            total = df[gid].sum()
-            rates[int(gid)] = round(total / num_weeks, 2)
-
-    return rates
+    num_weeks = max(len(df) / 7.0, 1.0)
+    return {
+        int(gid): round(df[gid].sum() / num_weeks, 2)
+        for gid in goal_ids if gid in df.columns
+    }
 
 
-# ─── Форматирование результата ─────────────────────────────
 def strength_label(c: float) -> str:
     a = abs(c)
     if a >= 0.9:
         return "🔴 очень сильная"
     if a >= 0.7:
         return "🟠 сильная"
-    if a >= 0.5:
-        return "🟡 заметная"
     return "🔵 умеренная"
 
 
 def format_results(results: dict, weekly_rates: dict, goals_map: dict,
-                   main_goal_ids: list, date1: str, date2: str) -> str:
-    """Красиво форматирует результат для Telegram."""
+                   main_goal_ids: list, date1: str, date2: str,
+                   counter_name: str = "") -> str:
     main_names = [goals_map.get(gid, str(gid)) for gid in main_goal_ids if gid in goals_map]
     total_main_rate = sum(weekly_rates.get(gid, 0) for gid in main_goal_ids)
 
     header = (
         f"<b>📊 Анализ сильных корреляций (|r| ≥ {THRESHOLD})</b>\n"
+        f"<b>Счётчик:</b> {counter_name}\n"
         f"<b>Главные цели:</b> {', '.join(main_names)}\n"
         f"<b>Период:</b> {date1} — {date2}\n"
         f"{'─' * 30}\n"
+        f"<b>📈 Суммарно главных: {total_main_rate:.2f}/нед</b>\n"
     )
-
-    # Средние срабатывания главных целей
-    main_rate_lines = []
     for gid in main_goal_ids:
         rate = weekly_rates.get(gid, 0)
         name = goals_map.get(gid, str(gid))
-        main_rate_lines.append(f"  • {name}: <b>{rate}</b>/нед")
-
-    header += f"<b>📈 Суммарно главных: {total_main_rate:.2f}/нед</b>\n"
-    header += "\n".join(main_rate_lines) + "\n"
+        header += f"  • {name}: <b>{rate}</b>/нед\n"
     header += f"{'─' * 30}\n"
 
-    # Фильтруем только сильные корреляции (на всякий случай, если THRESHOLD изменится)
-    strong_results = {gid: c for gid, c in results.items() if abs(c) >= THRESHOLD}
+    strong = {gid: c for gid, c in results.items() if abs(c) >= THRESHOLD}
 
-    if not strong_results:
+    if not strong:
         return header + "\n⚠️ Сильных корреляций (|r| ≥ 0.7) не найдено."
 
-    ranked = sorted(strong_results.items(), key=lambda x: abs(x[1]), reverse=True)
+    ranked = sorted(strong.items(), key=lambda x: abs(x[1]), reverse=True)
     lines = []
     for i, (gid, c) in enumerate(ranked, 1):
         name = goals_map.get(gid, str(gid))
         direction = "↗️" if c > 0 else "↘️"
         rate = weekly_rates.get(gid, 0)
         label = strength_label(c)
-
-        # Выделение, если срабатываний больше, чем у главной цели
-        highlight = ""
-        if rate > total_main_rate:
-            highlight = " 🔥 <b>(ВЫШЕ ГЛАВНОЙ)</b>"
-
+        highlight = " 🔥 <b>(ВЫШЕ ГЛАВНОЙ)</b>" if rate > total_main_rate else ""
         lines.append(
             f"<b>{i}. {name}</b>{highlight}\n"
             f"   r = <b>{c:+.3f}</b> {direction} {label}\n"
             f"   📊 ср. <b>{rate}</b>/нед"
         )
 
-    body = "\n\n".join(lines)
-    return header + "\n" + body
+    return header + "\n" + "\n\n".join(lines)
 
 
-# ─── Telegram handlers ────────────────────────────────────
+# ─── Inline keyboard helpers ──────────────────────────────
+
+def _counters_keyboard(counters: list) -> types.InlineKeyboardMarkup:
+    """Кнопки счётчиков — по одному в строку."""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for c in counters:
+        label = f"📍 {c['name']} ({c['site'] or c['id']})"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"ctr:{c['id']}"))
+    return kb
+
+
+def _goals_keyboard(goals_map: dict, selected: list) -> types.InlineKeyboardMarkup:
+    """
+    Кнопки целей с чекбоксами (✅/☑️).
+    Внизу кнопка «Запустить анализ» если хоть одна выбрана.
+    """
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for gid, name in sorted(goals_map.items(), key=lambda x: x[0]):
+        check = "✅" if gid in selected else "☑️"
+        short_name = name[:40] + "…" if len(name) > 40 else name
+        kb.add(types.InlineKeyboardButton(
+            f"{check} {short_name}",
+            callback_data=f"goal:{gid}"
+        ))
+    if selected:
+        kb.add(types.InlineKeyboardButton(
+            "🚀 Запустить анализ", callback_data="run_goals"
+        ))
+    kb.add(types.InlineKeyboardButton(
+        "❌ Отмена", callback_data="cancel_goals"
+    ))
+    return kb
+
+
+# ─── Основное меню ────────────────────────────────────────
+
+def send_main_menu(chat_id):
+    s = st(chat_id)
+
+    counter_str = f"📍 <b>{s.get('counter_name') or s.get('counter_id') or 'не выбран'}</b>"
+    main_ids = s.get("main_goal_ids", [])
+    goals_str = f"🎯 Главных целей: <b>{len(main_ids)}</b>" if main_ids else "🎯 Цели: <i>не выбраны</i>"
+    if s.get("date1") and s.get("date2"):
+        period_str = f"📅 Период: {s['date1']} — {s['date2']} (ручной)"
+    else:
+        period_str = "📅 Период: <i>авто (с первого срабатывания)</i>"
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📋 Выбрать счётчик", callback_data="open_counters"),
+        types.InlineKeyboardButton("🎯 Выбрать цели и запустить", callback_data="open_goals"),
+        types.InlineKeyboardButton("🚀 Запустить анализ (текущие цели)", callback_data="run_now"),
+        types.InlineKeyboardButton("📅 Статус и настройки", callback_data="show_status"),
+    )
+
+    bot.send_message(
+        chat_id,
+        f"<b>🤖 Бот корреляций Яндекс.Метрики</b>\n\n"
+        f"{counter_str}\n{goals_str}\n{period_str}\n\n"
+        f"Выберите действие:",
+        reply_markup=kb
+    )
+
+
+# ─── Команды ──────────────────────────────────────────────
 
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     if not guard(message):
         return
-    s = st(message.chat.id)
-    status_lines = []
-    if s["counter_id"]:
-        status_lines.append(f"📍 Счётчик: <b>{s['counter_id']}</b>")
-    if s["main_goal_ids"]:
-        status_lines.append(f"🎯 Главные цели: <code>{', '.join(map(str, s['main_goal_ids']))}</code>")
-    if s["date1"] and s["date2"]:
-        status_lines.append(f"📅 Период: {s['date1']} — {s['date2']}")
-    else:
-        status_lines.append("📅 Период: <i>авто (с первого срабатывания)</i>")
-
-    status = "\n".join(status_lines) if status_lines else "—"
-
-    bot.send_message(
-        message.chat.id,
-        f"<b>🤖 Бот корреляций Яндекс.Метрики</b>\n\n"
-        f"<b>Текущие настройки:</b>\n{status}\n\n"
-        f"<b>Команды:</b>\n"
-        f"/counter <code>&lt;id&gt;</code> — установить счётчик\n"
-        f"/goals — показать список целей счётчика\n"
-        f"/main <code>&lt;id,id,...&gt;</code> — задать главные цели\n"
-        f"/period <code>&lt;YYYY-MM-DD&gt; &lt;YYYY-MM-DD&gt;</code> — задать период вручную\n"
-        f"/autoperiod — сбросить период на авто\n"
-        f"/run — запустить анализ\n"
-        f"/status — текущие настройки\n"
-        f"/reset — сбросить все настройки\n\n"
-        f"<i>Период определяется автоматически: от первого срабатывания главной цели до сегодня. "
-        f"Можно переопределить командой /period.</i>",
-    )
+    send_main_menu(message.chat.id)
 
 
-@bot.message_handler(commands=["counter"])
-def cmd_counter(message):
+@bot.message_handler(commands=["counters"])
+def cmd_counters(message):
     if not guard(message):
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip().isdigit():
-        bot.send_message(message.chat.id, "Пример: <code>/counter 44147844</code>")
+    _show_counters(message.chat.id)
+
+
+def _show_counters(chat_id):
+    msg = bot.send_message(chat_id, "⏳ Загружаю список счётчиков…")
+    counters, err = get_counters()
+    if err:
+        bot.edit_message_text(f"❌ Ошибка: {err}", chat_id, msg.message_id)
         return
-    cid = args[1].strip()
-    st(message.chat.id)["counter_id"] = cid
-    # сбрасываем цели при смене счётчика
-    st(message.chat.id)["main_goal_ids"] = []
-    st(message.chat.id)["date1"] = None
-    st(message.chat.id)["date2"] = None
-    save()
-    bot.send_message(message.chat.id, f"✅ Счётчик установлен: <b>{cid}</b>\n\nТеперь используйте /goals чтобы увидеть цели.")
+    if not counters:
+        bot.edit_message_text("⚠️ Счётчики не найдены.", chat_id, msg.message_id)
+        return
+    kb = _counters_keyboard(counters)
+    bot.edit_message_text(
+        f"<b>Выберите счётчик</b> ({len(counters)} шт.):",
+        chat_id, msg.message_id,
+        reply_markup=kb
+    )
 
 
 @bot.message_handler(commands=["goals"])
@@ -397,74 +412,76 @@ def cmd_goals(message):
         return
     s = st(message.chat.id)
     if not s["counter_id"]:
-        bot.send_message(message.chat.id, "⚠️ Сначала задайте счётчик: /counter <id>")
+        bot.send_message(message.chat.id, MSG_NO_COUNTER)
         return
+    _show_goals(message.chat.id)
 
-    bot.send_message(message.chat.id, "⏳ Загружаю список целей…")
+
+def _show_goals(chat_id):
+    s = st(chat_id)
+    if not s["counter_id"]:
+        bot.send_message(chat_id, MSG_NO_COUNTER)
+        return
+    msg = bot.send_message(chat_id, "⏳ Загружаю цели…")
     goals_map, err = get_goals(s["counter_id"])
     if err:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {err}")
+        bot.edit_message_text(f"❌ Ошибка: {err}", chat_id, msg.message_id)
         return
     if not goals_map:
-        bot.send_message(message.chat.id, "⚠️ У этого счётчика нет целей.")
+        bot.edit_message_text("⚠️ У этого счётчика нет целей.", chat_id, msg.message_id)
         return
 
-    lines = [f"<b>Цели счётчика {s['counter_id']}:</b>\n"]
-    for gid, name in sorted(goals_map.items()):
-        marker = " ⭐" if gid in s.get("main_goal_ids", []) else ""
-        lines.append(f"<code>{gid}</code> — {name}{marker}")
+    # Сохраняем карту целей в state для последующих callback
+    s["_goals_cache"] = {str(k): v for k, v in goals_map.items()}
+    s["_goals_msg_id"] = msg.message_id
+    # pending = уже выбранные main_goal_ids (продолжаем с них)
+    s["pending_goal_ids"] = list(s.get("main_goal_ids", []))
+    save()
 
-    text = "\n".join(lines)
-    # Telegram ограничивает 4096 символов
-    if len(text) > 4000:
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            bot.send_message(message.chat.id, chunk)
-    else:
-        bot.send_message(message.chat.id, text)
+    name = s.get("counter_name") or s["counter_id"]
+    kb = _goals_keyboard(goals_map, s["pending_goal_ids"])
+    bot.edit_message_text(
+        f"<b>Цели счётчика «{name}»</b>\n"
+        f"✅ = выбрана как главная. Нажимайте чтобы выбрать/снять.\n"
+        f"Затем нажмите «🚀 Запустить анализ».",
+        chat_id, msg.message_id,
+        reply_markup=kb
+    )
 
 
-@bot.message_handler(commands=["main"])
-def cmd_main(message):
+@bot.message_handler(commands=["run"])
+def cmd_run_cmd(message):
     if not guard(message):
         return
-    s = st(message.chat.id)
-    if not s["counter_id"]:
-        bot.send_message(message.chat.id, "⚠️ Сначала задайте счётчик: /counter <id>")
+    _run_analysis(message.chat.id)
+
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    if not guard(message):
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        bot.send_message(message.chat.id, "Пример: <code>/main 255302693,257143059</code>\n\nИспользуйте /goals чтобы увидеть ID целей.")
-        return
-    ids = [int(x.strip()) for x in args[1].split(",") if x.strip().isdigit()]
-    if not ids:
-        bot.send_message(message.chat.id, "⚠️ Не распознаны ID целей. Пример: <code>/main 123,456</code>")
-        return
-    # Проверяем что цели принадлежат этому счётчику
-    goals_map, err = get_goals(s["counter_id"])
-    if err:
-        bot.send_message(message.chat.id, f"❌ Ошибка проверки целей: {err}")
-        return
-    bad_ids = [gid for gid in ids if gid not in goals_map]
-    if bad_ids:
-        bot.send_message(
-            message.chat.id,
-            f"⚠️ Цели {', '.join(map(str, bad_ids))} <b>не найдены</b> в счётчике {s['counter_id']}.\n"
-            f"Проверьте ID через /goals"
-        )
-        return
-    name_list = [f"{gid} ({goals_map[gid]})" for gid in ids]
-    s["main_goal_ids"] = ids
-    # Сбросить ручной период → автоопределение
-    s["date1"] = None
-    s["date2"] = None
-    save()
-    bot.send_message(
-        message.chat.id,
-        f"✅ Главные цели:\n" +
-        "\n".join(f"  • {n}" for n in name_list) + "\n\n"
-        f"📅 Период будет определён автоматически при /run.\n"
-        f"Или задайте вручную: /period"
-    )
+    _show_status(message.chat.id)
+
+
+def _show_status(chat_id):
+    s = st(chat_id)
+    lines = ["<b>📋 Текущие настройки:</b>\n"]
+    lines.append(f"📍 Счётчик: <b>{s.get('counter_name') or s.get('counter_id') or '—'}</b>")
+    if s.get("main_goal_ids"):
+        goals_cache = {int(k): v for k, v in s.get("_goals_cache", {}).items()}
+        goal_strs = []
+        for gid in s["main_goal_ids"]:
+            name = goals_cache.get(gid, str(gid))
+            goal_strs.append(f"  • {name} (id {gid})")
+        lines.append("🎯 Главные цели:\n" + "\n".join(goal_strs))
+    else:
+        lines.append("🎯 Главные цели: <i>не заданы</i>")
+    if s.get("date1") and s.get("date2"):
+        lines.append(f"📅 Период: {s['date1']} — {s['date2']} (ручной)")
+    else:
+        lines.append("📅 Период: <i>авто</i>")
+    lines.append(f"\n🔧 Порог: |r| ≥ {THRESHOLD}")
+    bot.send_message(chat_id, "\n".join(lines))
 
 
 @bot.message_handler(commands=["period"])
@@ -475,18 +492,16 @@ def cmd_period(message):
     if len(args) != 3:
         bot.send_message(message.chat.id, "Пример: <code>/period 2025-01-01 2025-12-31</code>")
         return
-    # Валидация формата дат
     for d in [args[1], args[2]]:
         try:
             datetime.strptime(d, "%Y-%m-%d")
         except ValueError:
-            bot.send_message(message.chat.id, f"⚠️ Неверный формат даты: {d}. Нужен YYYY-MM-DD.")
+            bot.send_message(message.chat.id, f"⚠️ Неверный формат даты: {d}")
             return
-
     st(message.chat.id)["date1"] = args[1]
     st(message.chat.id)["date2"] = args[2]
     save()
-    bot.send_message(message.chat.id, f"✅ Период установлен: <b>{args[1]} — {args[2]}</b>")
+    bot.send_message(message.chat.id, f"✅ Период: <b>{args[1]} — {args[2]}</b>")
 
 
 @bot.message_handler(commands=["autoperiod"])
@@ -496,26 +511,7 @@ def cmd_autoperiod(message):
     st(message.chat.id)["date1"] = None
     st(message.chat.id)["date2"] = None
     save()
-    bot.send_message(message.chat.id, "✅ Период сброшен на <b>автоопределение</b> (от первого срабатывания до сегодня).")
-
-
-@bot.message_handler(commands=["status"])
-def cmd_status(message):
-    if not guard(message):
-        return
-    s = st(message.chat.id)
-    lines = ["<b>📋 Текущие настройки:</b>\n"]
-    lines.append(f"📍 Счётчик: <b>{s.get('counter_id', '—') or '—'}</b>")
-    if s.get("main_goal_ids"):
-        lines.append(f"🎯 Главные цели: <code>{', '.join(map(str, s['main_goal_ids']))}</code>")
-    else:
-        lines.append("🎯 Главные цели: <i>не заданы</i>")
-    if s.get("date1") and s.get("date2"):
-        lines.append(f"📅 Период: {s['date1']} — {s['date2']} (ручной)")
-    else:
-        lines.append("📅 Период: <i>авто (от первого срабатывания до сегодня)</i>")
-    lines.append(f"\n🔧 Порог корреляции: |r| ≥ {THRESHOLD}")
-    bot.send_message(message.chat.id, "\n".join(lines))
+    bot.send_message(message.chat.id, "✅ Период сброшен на <b>автоопределение</b>.")
 
 
 @bot.message_handler(commands=["reset"])
@@ -526,125 +522,291 @@ def cmd_reset(message):
     if key in STATE:
         del STATE[key]
     save()
-    bot.send_message(message.chat.id, "✅ Все настройки сброшены. Начните с /counter.")
+    bot.send_message(message.chat.id, "✅ Все настройки сброшены. Нажмите /counters чтобы начать.")
 
 
-@bot.message_handler(commands=["run"])
-def cmd_run(message):
-    if not guard(message):
+# ─── Callback-обработчики (inline кнопки) ─────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data == "open_counters")
+def cb_open_counters(call):
+    if not guard_cb(call):
         return
-    s = st(message.chat.id)
+    bot.answer_callback_query(call.id)
+    _show_counters(call.message.chat.id)
 
+
+@bot.callback_query_handler(func=lambda c: c.data == "open_goals")
+def cb_open_goals(call):
+    if not guard_cb(call):
+        return
+    bot.answer_callback_query(call.id)
+    s = st(call.message.chat.id)
     if not s["counter_id"]:
-        bot.send_message(message.chat.id, "⚠️ Сначала задайте счётчик: /counter <id>")
+        bot.send_message(call.message.chat.id, MSG_NO_COUNTER)
         return
-    if not s["main_goal_ids"]:
-        bot.send_message(message.chat.id, "⚠️ Сначала задайте главные цели: /main <id,id,...>")
+    _show_goals(call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "run_now")
+def cb_run_now(call):
+    if not guard_cb(call):
+        return
+    bot.answer_callback_query(call.id)
+    _run_analysis(call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "show_status")
+def cb_show_status(call):
+    if not guard_cb(call):
+        return
+    bot.answer_callback_query(call.id)
+    _show_status(call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ctr:"))
+def cb_select_counter(call):
+    if not guard_cb(call):
+        return
+    counter_id = call.data.split(":", 1)[1]
+
+    # Достаём название счётчика из текста кнопки
+    counter_name = counter_id
+    for row in call.message.reply_markup.keyboard:
+        for btn in row:
+            if btn.callback_data == call.data:
+                # Убираем эмодзи "📍 " из начала
+                counter_name = btn.text.replace("📍 ", "").strip()
+
+    s = st(call.message.chat.id)
+    s["counter_id"] = counter_id
+    s["counter_name"] = counter_name
+    s["main_goal_ids"] = []
+    s["pending_goal_ids"] = []
+    s["date1"] = None
+    s["date2"] = None
+    save()
+
+    bot.answer_callback_query(call.id, f"✅ Выбран: {counter_name}")
+    bot.edit_message_text(
+        f"✅ Счётчик: <b>{counter_name}</b>\n\n⏳ Загружаю цели…",
+        call.message.chat.id, call.message.message_id
+    )
+    # Сразу показываем цели
+    _show_goals_inline(call.message.chat.id, call.message.message_id)
+
+
+def _show_goals_inline(chat_id, msg_id):
+    """Показать цели, редактируя существующее сообщение."""
+    s = st(chat_id)
+    goals_map, err = get_goals(s["counter_id"])
+    if err:
+        bot.edit_message_text(f"❌ Ошибка загрузки целей: {err}", chat_id, msg_id)
+        return
+    if not goals_map:
+        bot.edit_message_text("⚠️ У этого счётчика нет целей.", chat_id, msg_id)
+        return
+
+    s["_goals_cache"] = {str(k): v for k, v in goals_map.items()}
+    s["_goals_msg_id"] = msg_id
+    s["pending_goal_ids"] = []
+    save()
+
+    name = s.get("counter_name") or s["counter_id"]
+    kb = _goals_keyboard(goals_map, [])
+    bot.edit_message_text(
+        f"<b>Цели счётчика «{name}»</b> ({len(goals_map)} шт.)\n\n"
+        f"Нажимайте на цели чтобы выбрать главные.\n"
+        f"Затем нажмите «🚀 Запустить анализ».",
+        chat_id, msg_id,
+        reply_markup=kb
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("goal:"))
+def cb_toggle_goal(call):
+    if not guard_cb(call):
+        return
+    gid = int(call.data.split(":", 1)[1])
+    s = st(call.message.chat.id)
+
+    pending = list(s.get("pending_goal_ids", []))
+    if gid in pending:
+        pending.remove(gid)
+        bot.answer_callback_query(call.id, "☑️ Снято")
+    else:
+        pending.append(gid)
+        bot.answer_callback_query(call.id, "✅ Выбрано")
+
+    s["pending_goal_ids"] = pending
+    save()
+
+    # Перестраиваем клавиатуру
+    goals_map = {int(k): v for k, v in s.get("_goals_cache", {}).items()}
+    if not goals_map:
+        bot.answer_callback_query(call.id, "⚠️ Нет кэша целей, откройте /goals заново.")
+        return
+
+    kb = _goals_keyboard(goals_map, pending)
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id, call.message.message_id, reply_markup=kb
+        )
+    except Exception:
+        pass  # Если ничего не изменилось — Telegram вернёт ошибку "message not modified"
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "run_goals")
+def cb_run_goals(call):
+    if not guard_cb(call):
+        return
+    bot.answer_callback_query(call.id, "🚀 Запускаю анализ…")
+    s = st(call.message.chat.id)
+
+    pending = s.get("pending_goal_ids", [])
+    if not pending:
+        bot.send_message(call.message.chat.id, "⚠️ Не выбрано ни одной цели.")
+        return
+
+    # Фиксируем выбор
+    s["main_goal_ids"] = pending
+    s["pending_goal_ids"] = []
+    s["date1"] = None  # сбрасываем период → автоопределение
+    s["date2"] = None
+    save()
+
+    # Убираем кнопки из сообщения с целями
+    try:
+        goals_map = {int(k): v for k, v in s.get("_goals_cache", {}).items()}
+        selected_names = [goals_map.get(g, str(g)) for g in pending]
+        bot.edit_message_text(
+            f"✅ Главные цели сохранены:\n" +
+            "\n".join(f"  • {n}" for n in selected_names),
+            call.message.chat.id, call.message.message_id
+        )
+    except Exception:
+        pass
+
+    _run_analysis(call.message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cancel_goals")
+def cb_cancel_goals(call):
+    if not guard_cb(call):
+        return
+    bot.answer_callback_query(call.id, "Отменено")
+    s = st(call.message.chat.id)
+    s["pending_goal_ids"] = []
+    save()
+    try:
+        bot.edit_message_text("❌ Выбор целей отменён.", call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+
+# ─── Основной анализ ──────────────────────────────────────
+
+def _run_analysis(chat_id):
+    s = st(chat_id)
+
+    if not s.get("counter_id"):
+        bot.send_message(chat_id, MSG_NO_COUNTER)
+        return
+    if not s.get("main_goal_ids"):
+        bot.send_message(chat_id, "⚠️ Не выбраны главные цели. Используйте /goals чтобы выбрать.")
         return
 
     try:
-        # 1. Определяем период
         date2 = s.get("date2") or date.today().isoformat()
         date1 = s.get("date1")
 
         if not date1:
-            bot.send_message(message.chat.id, "⏳ Определяю дату первого срабатывания главных целей…")
+            msg = bot.send_message(chat_id, "⏳ Определяю дату первого срабатывания…")
             date1 = detect_first_trigger_date(s["counter_id"], s["main_goal_ids"])
             if not date1:
-                bot.send_message(
-                    message.chat.id,
-                    "⚠️ Не удалось определить первое срабатывание. "
-                    "Задайте период вручную: /period YYYY-MM-DD YYYY-MM-DD"
+                bot.edit_message_text(
+                    "⚠️ Не удалось определить первое срабатывание.\n"
+                    "Задайте период вручную: <code>/period ГГГГ-ММ-ДД ГГГГ-ММ-ДД</code>",
+                    chat_id, msg.message_id
                 )
                 return
-            bot.send_message(
-                message.chat.id,
-                f"📅 Автопериод: <b>{date1} — {date2}</b>\n"
-                f"<i>(от первого срабатывания до сегодня)</i>"
+            bot.edit_message_text(
+                f"📅 Автопериод: <b>{date1} — {date2}</b>",
+                chat_id, msg.message_id
             )
 
-        # 2. Получаем список целей
-        bot.send_message(message.chat.id, "⏳ Загружаю цели и данные…")
+        msg2 = bot.send_message(chat_id, "⏳ Загружаю данные по целям…")
         goals_map, err = get_goals(s["counter_id"])
         if err:
-            bot.send_message(message.chat.id, f"❌ Ошибка получения целей: {err}")
+            bot.edit_message_text(f"❌ Ошибка получения целей: {err}", chat_id, msg2.message_id)
             return
 
         all_goal_ids = sorted(goals_map.keys())
-
-        # 3. Получаем данные
         df, err = fetch_daily_reaches(s["counter_id"], date1, date2, all_goal_ids)
         if err:
-            bot.send_message(message.chat.id, f"❌ Ошибка получения данных: {err}")
+            bot.edit_message_text(f"❌ Ошибка данных: {err}", chat_id, msg2.message_id)
             return
-
         if df.empty:
-            bot.send_message(message.chat.id, "⚠️ Нет данных за указанный период.")
+            bot.edit_message_text("⚠️ Нет данных за период.", chat_id, msg2.message_id)
             return
 
-        # 4. Считаем корреляции
+        bot.edit_message_text("⏳ Считаю корреляции…", chat_id, msg2.message_id)
+
         results, err = compute_correlations(df, s["main_goal_ids"])
         if err:
-            bot.send_message(message.chat.id, f"⚠️ {err}")
+            bot.edit_message_text(f"⚠️ {err}", chat_id, msg2.message_id)
             return
 
-        # 5. Считаем средние срабатывания в неделю
         weekly_rates = compute_weekly_rate(df, all_goal_ids)
-
-        # 6. Форматируем и отправляем
+        counter_name = s.get("counter_name") or s["counter_id"]
         text = format_results(
             results or {}, weekly_rates, goals_map,
-            s["main_goal_ids"], date1, date2
+            s["main_goal_ids"], date1, date2, counter_name
         )
 
-        # Telegram ограничивает 4096 символов
-        if len(text) > 4000:
-            parts = []
-            current = ""
-            for line in text.split("\n"):
-                if len(current) + len(line) + 1 > 3900:
-                    parts.append(current)
-                    current = line
-                else:
-                    current += "\n" + line if current else line
-            if current:
-                parts.append(current)
-            for part in parts:
-                bot.send_message(message.chat.id, part)
-        else:
-            bot.send_message(message.chat.id, text)
+        # Добавляем кнопку «повторный запуск»
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔄 Обновить", callback_data="run_now"))
+        kb.add(types.InlineKeyboardButton("🎯 Сменить цели", callback_data="open_goals"))
+        kb.add(types.InlineKeyboardButton("📋 Сменить счётчик", callback_data="open_counters"))
 
-        log.info(f"Анализ завершён для chat_id={message.chat.id}, "
-                 f"найдено {len(results or {})} корреляций.")
+        bot.delete_message(chat_id, msg2.message_id)
+
+        if len(text) > 4000:
+            chunks = [text[i:i+3900] for i in range(0, len(text), 3900)]
+            for chunk in chunks[:-1]:
+                bot.send_message(chat_id, chunk)
+            bot.send_message(chat_id, chunks[-1], reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, reply_markup=kb)
+
+        log.info(f"Анализ chat={chat_id}: {len(results or {})} корреляций.")
 
     except Exception as e:
-        log.error(f"Ошибка при выполнении /run: {traceback.format_exc()}")
+        log.error(f"Ошибка /run: {traceback.format_exc()}")
         bot.send_message(
-            message.chat.id,
-            f"❌ Произошла ошибка:\n<code>{str(e)[:500]}</code>\n\n"
-            f"Попробуйте позже или проверьте настройки."
+            chat_id,
+            f"❌ Ошибка:\n<code>{str(e)[:400]}</code>\n\nПопробуйте позже."
         )
 
 
-# ─── Запуск ────────────────────────────────────────────────
+# ─── Запуск ───────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Установка команд меню…")
     try:
         commands = [
-            types.BotCommand("start", "Главное меню и статус"),
-            types.BotCommand("counter", "ID счётчика (напр. /counter 123)"),
-            types.BotCommand("goals", "Список всех целей счётчика"),
-            types.BotCommand("main", "Задать главные цели (напр. /main 1,2)"),
-            types.BotCommand("run", "🚀 ЗАПУСТИТЬ АНАЛИЗ"),
-            types.BotCommand("status", "Текущие настройки"),
-            types.BotCommand("period", "Период вручную (ГГГГ-ММ-ДД ГГГГ-ММ-ДД)"),
-            types.BotCommand("autoperiod", "Вернуть авто-период"),
-            types.BotCommand("reset", "Сбросить всё")
+            types.BotCommand("start",      "🏠 Главное меню"),
+            types.BotCommand("counters",   "📋 Выбрать счётчик"),
+            types.BotCommand("goals",      "🎯 Выбрать главные цели"),
+            types.BotCommand("run",        "🚀 Запустить анализ"),
+            types.BotCommand("status",     "📊 Текущие настройки"),
+            types.BotCommand("period",     "📅 Задать период вручную"),
+            types.BotCommand("autoperiod", "🔄 Авто-период"),
+            types.BotCommand("reset",      "🗑 Сбросить всё"),
         ]
         bot.set_my_commands(commands)
-        log.info("Команды меню успешно установлены.")
+        log.info("Команды меню установлены.")
     except Exception as e:
-        log.error(f"Ошибка при установке команд: {e}")
+        log.error(f"Ошибка установки команд: {e}")
 
-    log.info("Бот запущен, ожидаю сообщения…")
+    log.info("Бот запущен, жду сообщений…")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
