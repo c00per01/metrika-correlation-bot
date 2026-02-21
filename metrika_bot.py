@@ -29,7 +29,7 @@ if not BOT_TOKEN or not METRIKA_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 HEADERS = {"Authorization": f"OAuth {METRIKA_TOKEN}"}
 
-THRESHOLD = 0.4  # умеренная корреляция и выше
+THRESHOLD = 0.7  # сильная корреляция и выше
 
 logging.basicConfig(
     level=logging.INFO,
@@ -287,11 +287,12 @@ def format_results(results: dict, weekly_rates: dict, goals_map: dict,
                    main_goal_ids: list, date1: str, date2: str) -> str:
     """Красиво форматирует результат для Telegram."""
     main_names = [goals_map.get(gid, str(gid)) for gid in main_goal_ids if gid in goals_map]
+    total_main_rate = sum(weekly_rates.get(gid, 0) for gid in main_goal_ids)
+
     header = (
-        f"<b>📊 Корреляции целей Яндекс.Метрики</b>\n"
+        f"<b>📊 Анализ сильных корреляций (|r| ≥ {THRESHOLD})</b>\n"
         f"<b>Главные цели:</b> {', '.join(main_names)}\n"
         f"<b>Период:</b> {date1} — {date2}\n"
-        f"<b>Порог:</b> |r| ≥ {THRESHOLD}\n"
         f"{'─' * 30}\n"
     )
 
@@ -302,24 +303,33 @@ def format_results(results: dict, weekly_rates: dict, goals_map: dict,
         name = goals_map.get(gid, str(gid))
         main_rate_lines.append(f"  • {name}: <b>{rate}</b>/нед")
 
-    header += "<b>📈 Ср. срабатыв. главных целей в неделю:</b>\n"
+    header += f"<b>📈 Суммарно главных: {total_main_rate:.2f}/нед</b>\n"
     header += "\n".join(main_rate_lines) + "\n"
     header += f"{'─' * 30}\n"
 
-    if not results:
-        return header + "\n⚠️ Корреляций умеренной силы и выше — не найдено."
+    # Фильтруем только сильные корреляции (на всякий случай, если THRESHOLD изменится)
+    strong_results = {gid: c for gid, c in results.items() if abs(c) >= THRESHOLD}
 
-    ranked = sorted(results.items(), key=lambda x: abs(x[1]), reverse=True)
+    if not strong_results:
+        return header + "\n⚠️ Сильных корреляций (|r| ≥ 0.7) не найдено."
+
+    ranked = sorted(strong_results.items(), key=lambda x: abs(x[1]), reverse=True)
     lines = []
     for i, (gid, c) in enumerate(ranked, 1):
         name = goals_map.get(gid, str(gid))
         direction = "↗️" if c > 0 else "↘️"
         rate = weekly_rates.get(gid, 0)
         label = strength_label(c)
+
+        # Выделение, если срабатываний больше, чем у главной цели
+        highlight = ""
+        if rate > total_main_rate:
+            highlight = " 🔥 <b>(ВЫШЕ ГЛАВНОЙ)</b>"
+
         lines.append(
-            f"<b>{i}.</b> {name}\n"
+            f"<b>{i}. {name}</b>{highlight}\n"
             f"   r = <b>{c:+.3f}</b> {direction} {label}\n"
-            f"   📊 ср. {rate}/нед"
+            f"   📊 ср. <b>{rate}</b>/нед"
         )
 
     body = "\n\n".join(lines)
@@ -618,5 +628,23 @@ def cmd_run(message):
 
 # ─── Запуск ────────────────────────────────────────────────
 if __name__ == "__main__":
+    log.info("Установка команд меню…")
+    try:
+        commands = [
+            types.BotCommand("start", "Главное меню и статус"),
+            types.BotCommand("counter", "ID счётчика (напр. /counter 123)"),
+            types.BotCommand("goals", "Список всех целей счётчика"),
+            types.BotCommand("main", "Задать главные цели (напр. /main 1,2)"),
+            types.BotCommand("run", "🚀 ЗАПУСТИТЬ АНАЛИЗ"),
+            types.BotCommand("status", "Текущие настройки"),
+            types.BotCommand("period", "Период вручную (ГГГГ-ММ-ДД ГГГГ-ММ-ДД)"),
+            types.BotCommand("autoperiod", "Вернуть авто-период"),
+            types.BotCommand("reset", "Сбросить всё")
+        ]
+        bot.set_my_commands(commands)
+        log.info("Команды меню успешно установлены.")
+    except Exception as e:
+        log.error(f"Ошибка при установке команд: {e}")
+
     log.info("Бот запущен, ожидаю сообщения…")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
