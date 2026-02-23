@@ -88,13 +88,14 @@ def save():
 # ─── Guard ────────────────────────────────────────────────
 def guard(message):
     if not ALLOWED_USER_ID:
-        return True
+        log.error("ALLOWED_USER_ID не задан в окружении! Доступ запрещён для всех.")
+        return False
     return str(message.from_user.id) == ALLOWED_USER_ID
 
 
 def guard_cb(call):
     if not ALLOWED_USER_ID:
-        return True
+        return False
     return str(call.from_user.id) == ALLOWED_USER_ID
 
 
