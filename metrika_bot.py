@@ -29,7 +29,7 @@ if not BOT_TOKEN or not METRIKA_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 HEADERS = {"Authorization": f"OAuth {METRIKA_TOKEN}"}
 
-THRESHOLD = 0.7  # сильная корреляция и выше
+THRESHOLD = 0.4  # умеренная корреляция и выше
 
 logging.basicConfig(
     level=logging.INFO,
@@ -275,7 +275,7 @@ def format_results(results: dict, weekly_rates: dict, goals_map: dict,
     total_main_rate = sum(weekly_rates.get(gid, 0) for gid in main_goal_ids)
 
     header = (
-        f"<b>📊 Анализ сильных корреляций (|r| ≥ {THRESHOLD})</b>\n"
+        f"<b>📊 Анализ корреляций (|r| ≥ {THRESHOLD})</b>\n"
         f"<b>Счётчик:</b> {counter_name}\n"
         f"<b>Главные цели:</b> {', '.join(main_names)}\n"
         f"<b>Период:</b> {date1} — {date2}\n"
@@ -288,12 +288,20 @@ def format_results(results: dict, weekly_rates: dict, goals_map: dict,
         header += f"  • {name}: <b>{rate}</b>/нед\n"
     header += f"{'─' * 30}\n"
 
-    strong = {gid: c for gid, c in results.items() if abs(c) >= THRESHOLD}
+    filtered = {gid: c for gid, c in results.items() if abs(c) >= THRESHOLD}
 
-    if not strong:
-        return header + "\n⚠️ Сильных корреляций (|r| ≥ 0.7) не найдено."
+    if not filtered:
+        return header + f"\n⚠️ Корреляций (|r| ≥ {THRESHOLD}) не найдено."
 
-    ranked = sorted(strong.items(), key=lambda x: abs(x[1]), reverse=True)
+    # Сортировка:
+    # 1. Приоритет (True/False): среднее кол-во в неделю больше суммы главных целей
+    # 2. Сила корреляции |r| по убыванию
+    ranked = sorted(
+        filtered.items(),
+        key=lambda x: (weekly_rates.get(x[0], 0) > total_main_rate, abs(x[1])),
+        reverse=True
+    )
+    
     lines = []
     for i, (gid, c) in enumerate(ranked, 1):
         name = goals_map.get(gid, str(gid))
