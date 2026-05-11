@@ -818,4 +818,22 @@ if __name__ == "__main__":
         log.error(f"Ошибка установки команд: {e}")
 
     log.info("Бот запущен, жду сообщений…")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
+    import time
+
+    while True:
+        try:
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=60,
+                # При исключении внутри хендлера — не останавливать polling
+                allowed_updates=None,
+                restart_on_change=False,
+                logger_level=logging.WARNING,
+            )
+        except Exception as poll_err:
+            log.error(f"infinity_polling упал: {poll_err}. Перезапуск через 15 с…")
+            time.sleep(15)
+        except KeyboardInterrupt:
+            log.info("Бот остановлен вручную.")
+            break
